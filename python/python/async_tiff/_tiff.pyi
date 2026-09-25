@@ -14,18 +14,18 @@ class TIFF:
         *,
         store: ObjectStore | ObspecInput,
         prefetch: int = 32768,
-        multiplier: int | float = 2.0,
+        readahead: int = 1048576,
     ) -> TIFF:
         """Open a new TIFF.
 
         Args:
             path: The path within the store to read from.
             store: The backend to use for data fetching.
-            prefetch: The number of initial bytes to read up front.
-            multiplier: The multiplier to use for readahead size growth. Must be
-                greater than 1.0. For example, for a value of `2.0`, the first metadata
-                read will be of size `prefetch`, and then the next read will be of size
-                `prefetch * 2`.
+            prefetch: The number of bytes to read at the start of the file, and at
+                any metadata far from what has already been read.
+            readahead: How far past already-read bytes a metadata read counts as near.
+                A near read also fetches the gap before it and up to `readahead` bytes
+                past it.
 
         Returns:
             A TIFF instance.
@@ -56,7 +56,9 @@ class TIFF:
             The requested IFD.
         """
 
-    async def ifd_at(self, offset: int, *, prefetch: int = 32768) -> ImageFileDirectory:
+    async def ifd_at(
+        self, offset: int, *, prefetch: int = 32768, readahead: int = 1048576
+    ) -> ImageFileDirectory:
         """Read the IFD at a byte offset.
 
         [`ifds`][async_tiff.TIFF.ifds] follows the chain of IFDs from the header, which
@@ -66,6 +68,7 @@ class TIFF:
         Args:
             offset: The byte offset of the IFD, such as a value of the SubIFDs tag.
             prefetch: The number of bytes to read at `offset` up front.
+            readahead: As for [`open`][async_tiff.TIFF.open].
 
         Returns:
             The IFD at that offset.

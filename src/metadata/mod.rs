@@ -54,8 +54,8 @@
 //!
 //! Thus, it is **imperative to always supply some sort of caching, prefetching, or buffering**
 //! middleware when reading metadata. [`ReadaheadMetadataCache`][cache::ReadaheadMetadataCache] is
-//! an example of this, which fetches the first `N` bytes out of a file, and then multiplies the
-//! size of any subsequent fetches by a given `multiplier`.
+//! an example of this, which fetches the first `N` bytes out of a file, and holds every range it
+//! fetches, so metadata far from the front of the file is read where it is.
 
 pub mod cache;
 mod fetch;

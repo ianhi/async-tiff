@@ -26,11 +26,11 @@ pub(crate) struct PyTIFF {
 async fn open(
     reader: Arc<dyn AsyncFileReader>,
     prefetch: u64,
-    multiplier: f64,
+    readahead: u64,
 ) -> PyAsyncTiffResult<PyTIFF> {
     let metadata_fetch = ReadaheadMetadataCache::new(reader.clone())
         .with_initial_size(prefetch)
-        .with_multiplier(multiplier);
+        .with_readahead(readahead);
     let mut metadata_reader = TiffMetadataReader::try_open(&metadata_fetch).await?;
     let ifds = metadata_reader.read_all_ifds(&metadata_fetch).await?;
     Ok(PyTIFF {
@@ -45,10 +45,13 @@ async fn read_ifd_at(
     reader: Arc<dyn AsyncFileReader>,
     offset: u64,
     prefetch: u64,
+    readahead: u64,
     bigtiff: bool,
     endianness: Endianness,
 ) -> PyAsyncTiffResult<PyImageFileDirectory> {
-    let metadata_fetch = ReadaheadMetadataCache::new(reader.clone()).with_initial_size(prefetch);
+    let metadata_fetch = ReadaheadMetadataCache::new(reader.clone())
+        .with_initial_size(prefetch)
+        .with_readahead(readahead);
     let ifd_reader =
         ImageFileDirectoryReader::open(&metadata_fetch, offset, bigtiff, endianness).await?;
     let ifd = ifd_reader.read(&metadata_fetch).await?;
@@ -58,21 +61,21 @@ async fn read_ifd_at(
 #[pymethods]
 impl PyTIFF {
     #[classmethod]
-    #[pyo3(signature = (path, *, store, prefetch=32768, multiplier=2.0))]
+    #[pyo3(signature = (path, *, store, prefetch=32768, readahead=1048576))]
     fn open<'py>(
         _cls: &Bound<'py, PyType>,
         py: Python<'py>,
         path: String,
         store: StoreInput,
         prefetch: u64,
-        multiplier: f64,
+        readahead: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let reader = store.into_async_file_reader(path);
 
         let cog_reader =
             future_into_py(
                 py,
-                async move { Ok(open(reader, prefetch, multiplier).await?) },
+                async move { Ok(open(reader, prefetch, readahead).await?) },
             )?;
         Ok(cog_reader)
     }
@@ -111,17 +114,18 @@ impl PyTIFF {
     ///
     /// `ifds` follows the chain, which does not include SubIFDs (tag 330); those offsets are values
     /// of that tag, and pyramid levels are commonly written there.
-    #[pyo3(signature = (offset, *, prefetch=32768))]
+    #[pyo3(signature = (offset, *, prefetch=32768, readahead=1048576))]
     fn ifd_at<'py>(
         &'py self,
         py: Python<'py>,
         offset: u64,
         prefetch: u64,
+        readahead: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let reader = self.reader.clone();
         let (bigtiff, endianness) = (self.bigtiff, self.endianness);
         future_into_py(py, async move {
-            Ok(read_ifd_at(reader, offset, prefetch, bigtiff, endianness).await?)
+            Ok(read_ifd_at(reader, offset, prefetch, readahead, bigtiff, endianness).await?)
         })
     }
 
