@@ -372,9 +372,8 @@ impl ImageFileDirectory {
             geo_key_directory = Some(GeoKeyDirectory::from_tags(tags)?);
         }
 
-        // SamplesPerPixel (tag 277) defaults to 1 when the tag is absent.
-        // TIFF 6.0 spec, "SamplesPerPixel ... Default = 1": https://download.osgeo.org/libtiff/doc/TIFF6.pdf
-        // Many single-channel grayscale TIFFs (e.g. PerkinElmer/Phenix microscopy) omit it.
+        // Samples per pixel defaults to 1
+        // https://web.archive.org/web/20240329145232/https://www.awaresystems.be/imaging/tiff/tifftags/samplesperpixel.html
         let samples_per_pixel = samples_per_pixel.unwrap_or(1);
         let planar_configuration = if let Some(planar_configuration) = planar_configuration {
             planar_configuration
