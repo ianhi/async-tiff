@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::io::Read;
 
 use bytes::Bytes;
 
 use crate::error::{AsyncTiffError, AsyncTiffResult, TiffError, TiffFormatError};
 use crate::metadata::fetch::MetadataCursor;
 use crate::metadata::MetadataFetch;
-use crate::reader::Endianness;
+use crate::reader::{EndianAwareReader, Endianness};
 use crate::tag_value::TagValue;
 use crate::tags::{Tag, Type};
 use crate::{ImageFileDirectory, TIFF};
@@ -243,7 +242,7 @@ impl ImageFileDirectoryReader {
     /// Keep in mind that you'll still need to call [`finish`][Self::finish] to get the byte offset
     /// of the next IFD.
     pub async fn read<F: MetadataFetch>(&self, fetch: &F) -> AsyncTiffResult<ImageFileDirectory> {
-        let mut tags = HashMap::with_capacity(self.tag_count as usize);
+        let mut tags = HashMap::new();
         for tag_idx in 0..self.tag_count {
             let (tag, value) = self.read_tag(fetch, tag_idx).await?;
             tags.insert(tag, value);
@@ -287,9 +286,9 @@ async fn read_tag<F: MetadataFetch>(
     let tag_name = Tag::from_u16_exhaustive(cursor.read_u16().await?);
 
     let tag_type_code = cursor.read_u16().await?;
-    let tag_type = Type::from_u16(tag_type_code).expect(
-        "Unknown tag type {tag_type_code}. TODO: we should skip entries with unknown tag types.",
-    );
+    let tag_type = Type::from_u16(tag_type_code).ok_or(TiffError::FormatError(
+        TiffFormatError::InvalidTagValueType(tag_name),
+    ))?;
     let count = if bigtiff {
         cursor.read_u64().await?
     } else {
@@ -312,7 +311,6 @@ async fn read_tag_value<F: MetadataFetch>(
     count: u64,
     bigtiff: bool,
 ) -> AsyncTiffResult<TagValue> {
-    // Case 1: there are no values so we can return immediately.
     if count == 0 {
         return Ok(TagValue::List(vec![]));
     }
@@ -328,42 +326,45 @@ async fn read_tag_value<F: MetadataFetch>(
         | Type::SRATIONAL
         | Type::IFD8 => 8,
     };
+    let value_byte_length = count
+        .checked_mul(tag_size)
+        .ok_or(TiffError::FormatError(TiffFormatError::InvalidTag))?;
 
-    let value_byte_length = count.checked_mul(tag_size).unwrap();
+    // A value that fits in the entry's value field is stored there; otherwise the field holds the
+    // offset of the value.
+    let value_field_size = if bigtiff { 8 } else { 4 };
+    if value_byte_length > value_field_size {
+        let offset = if bigtiff {
+            cursor.read_u64().await?
+        } else {
+            cursor.read_u32().await?.into()
+        };
+        cursor.seek(offset);
+    }
+    let data = cursor.read(value_byte_length).await?;
+    decode_values(data, tag_type, count)
+}
 
-    // Case 2: there is one value.
-    if count == 1 {
-        // 2a: the value is 5-8 bytes and we're in BigTiff mode.
-        if bigtiff && value_byte_length > 4 && value_byte_length <= 8 {
-            let mut data = cursor.read(value_byte_length).await?;
+/// Decode `count` values of `tag_type` from `data`, which holds exactly their bytes.
+///
+/// One value decodes to a scalar and several to a list, except ASCII, which is always a string.
+fn decode_values(
+    mut data: EndianAwareReader,
+    tag_type: Type,
+    count: u64,
+) -> AsyncTiffResult<TagValue> {
+    if tag_type == Type::ASCII {
+        let bytes = data.into_inner().0.into_inner();
+        // Strings may be null-terminated, so anything from the first null byte on is dropped
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        return Ok(TagValue::Ascii(
+            String::from_utf8_lossy(&bytes[..end]).into_owned(),
+        ));
+    }
 
-            return Ok(match tag_type {
-                Type::LONG8 => TagValue::UnsignedBig(data.read_u64()?),
-                Type::SLONG8 => TagValue::SignedBig(data.read_i64()?),
-                Type::DOUBLE => TagValue::Double(data.read_f64()?),
-                Type::RATIONAL => TagValue::Rational(data.read_u32()?, data.read_u32()?),
-                Type::SRATIONAL => TagValue::SRational(data.read_i32()?, data.read_i32()?),
-                Type::IFD8 => TagValue::IfdBig(data.read_u64()?),
-                Type::BYTE
-                | Type::SBYTE
-                | Type::ASCII
-                | Type::UNDEFINED
-                | Type::SHORT
-                | Type::SSHORT
-                | Type::LONG
-                | Type::SLONG
-                | Type::FLOAT
-                | Type::IFD => unreachable!(),
-            });
-        }
-
-        // NOTE: we should only be reading value_byte_length when it's 4 bytes or fewer. Right now
-        // we're reading even if it's 8 bytes, but then only using the first 4 bytes of this
-        // buffer.
-        let mut data = cursor.read(value_byte_length).await?;
-
-        // 2b: the value is at most 4 bytes or doesn't fit in the offset field.
-        return Ok(match tag_type {
+    let mut values = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        values.push(match tag_type {
             Type::BYTE | Type::UNDEFINED => TagValue::Byte(data.read_u8()?),
             Type::SBYTE => TagValue::SignedByte(data.read_i8()?),
             Type::SHORT => TagValue::Short(data.read_u16()?),
@@ -371,274 +372,22 @@ async fn read_tag_value<F: MetadataFetch>(
             Type::LONG => TagValue::Unsigned(data.read_u32()?),
             Type::SLONG => TagValue::Signed(data.read_i32()?),
             Type::FLOAT => TagValue::Float(data.read_f32()?),
-            Type::ASCII => {
-                if data.as_ref()[0] == 0 {
-                    TagValue::Ascii("".to_string())
-                } else {
-                    panic!("Invalid tag");
-                    // return Err(TiffError::FormatError(TiffFormatError::InvalidTag));
-                }
-            }
-            Type::LONG8 => {
-                let offset = data.read_u32()?;
-                cursor.seek(offset as _);
-                TagValue::UnsignedBig(cursor.read_u64().await?)
-            }
-            Type::SLONG8 => {
-                let offset = data.read_u32()?;
-                cursor.seek(offset as _);
-                TagValue::SignedBig(cursor.read_i64().await?)
-            }
-            Type::DOUBLE => {
-                let offset = data.read_u32()?;
-                cursor.seek(offset as _);
-                TagValue::Double(cursor.read_f64().await?)
-            }
-            Type::RATIONAL => {
-                let offset = data.read_u32()?;
-                cursor.seek(offset as _);
-                let numerator = cursor.read_u32().await?;
-                let denominator = cursor.read_u32().await?;
-                TagValue::Rational(numerator, denominator)
-            }
-            Type::SRATIONAL => {
-                let offset = data.read_u32()?;
-                cursor.seek(offset as _);
-                let numerator = cursor.read_i32().await?;
-                let denominator = cursor.read_i32().await?;
-                TagValue::SRational(numerator, denominator)
-            }
             Type::IFD => TagValue::Ifd(data.read_u32()?),
-            Type::IFD8 => {
-                let offset = data.read_u32()?;
-                cursor.seek(offset as _);
-                TagValue::IfdBig(cursor.read_u64().await?)
-            }
+            Type::LONG8 => TagValue::UnsignedBig(data.read_u64()?),
+            Type::SLONG8 => TagValue::SignedBig(data.read_i64()?),
+            Type::DOUBLE => TagValue::Double(data.read_f64()?),
+            Type::RATIONAL => TagValue::Rational(data.read_u32()?, data.read_u32()?),
+            Type::SRATIONAL => TagValue::SRational(data.read_i32()?, data.read_i32()?),
+            Type::IFD8 => TagValue::IfdBig(data.read_u64()?),
+            Type::ASCII => unreachable!("decoded above"),
         });
     }
 
-    // Case 3: There is more than one value, but it fits in the offset field.
-    if value_byte_length <= 4 || bigtiff && value_byte_length <= 8 {
-        let mut data = cursor.read(value_byte_length).await?;
-        if bigtiff {
-            cursor.advance(8 - value_byte_length);
-        } else {
-            cursor.advance(4 - value_byte_length);
-        }
-
-        match tag_type {
-            Type::BYTE | Type::UNDEFINED => {
-                return {
-                    Ok(TagValue::List(
-                        (0..count)
-                            .map(|_| TagValue::Byte(data.read_u8().unwrap()))
-                            .collect(),
-                    ))
-                };
-            }
-            Type::SBYTE => {
-                return {
-                    Ok(TagValue::List(
-                        (0..count)
-                            .map(|_| TagValue::SignedByte(data.read_i8().unwrap()))
-                            .collect(),
-                    ))
-                }
-            }
-            Type::ASCII => {
-                let mut buf = vec![0; count as usize];
-                data.read_exact(&mut buf)?;
-                if buf.is_ascii() && buf.ends_with(&[0]) {
-                    let v = std::str::from_utf8(&buf)
-                        .map_err(|err| AsyncTiffError::General(err.to_string()))?;
-                    let v = v.trim_matches(char::from(0));
-                    return Ok(TagValue::Ascii(v.into()));
-                } else {
-                    panic!("Invalid tag");
-                    // return Err(TiffError::FormatError(TiffFormatError::InvalidTag));
-                }
-            }
-            Type::SHORT => {
-                let mut v = Vec::new();
-                for _ in 0..count {
-                    v.push(TagValue::Short(data.read_u16()?));
-                }
-                return Ok(TagValue::List(v));
-            }
-            Type::SSHORT => {
-                let mut v = Vec::new();
-                for _ in 0..count {
-                    v.push(TagValue::SignedShort(data.read_i16()?));
-                }
-                return Ok(TagValue::List(v));
-            }
-            Type::LONG => {
-                let mut v = Vec::new();
-                for _ in 0..count {
-                    v.push(TagValue::Unsigned(data.read_u32()?));
-                }
-                return Ok(TagValue::List(v));
-            }
-            Type::SLONG => {
-                let mut v = Vec::new();
-                for _ in 0..count {
-                    v.push(TagValue::Signed(data.read_i32()?));
-                }
-                return Ok(TagValue::List(v));
-            }
-            Type::FLOAT => {
-                let mut v = Vec::new();
-                for _ in 0..count {
-                    v.push(TagValue::Float(data.read_f32()?));
-                }
-                return Ok(TagValue::List(v));
-            }
-            Type::IFD => {
-                let mut v = Vec::new();
-                for _ in 0..count {
-                    v.push(TagValue::Ifd(data.read_u32()?));
-                }
-                return Ok(TagValue::List(v));
-            }
-            Type::LONG8
-            | Type::SLONG8
-            | Type::RATIONAL
-            | Type::SRATIONAL
-            | Type::DOUBLE
-            | Type::IFD8 => {
-                unreachable!()
-            }
-        }
-    }
-
-    // Seek cursor
-    let offset = if bigtiff {
-        cursor.read_u64().await?
+    Ok(if count == 1 {
+        values.pop().unwrap()
     } else {
-        cursor.read_u32().await?.into()
-    };
-    cursor.seek(offset);
-
-    // Case 4: there is more than one value, and it doesn't fit in the offset field.
-    match tag_type {
-        // TODO check if this could give wrong results
-        // at a different endianess of file/computer.
-        Type::BYTE | Type::UNDEFINED => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Byte(cursor.read_u8().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::SBYTE => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::SignedByte(cursor.read_i8().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::SHORT => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Short(cursor.read_u16().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::SSHORT => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::SignedShort(cursor.read_i16().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::LONG => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Unsigned(cursor.read_u32().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::SLONG => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Signed(cursor.read_i32().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::FLOAT => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Float(cursor.read_f32().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::DOUBLE => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Double(cursor.read_f64().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::RATIONAL => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Rational(
-                    cursor.read_u32().await?,
-                    cursor.read_u32().await?,
-                ))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::SRATIONAL => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::SRational(
-                    cursor.read_i32().await?,
-                    cursor.read_i32().await?,
-                ))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::LONG8 => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::UnsignedBig(cursor.read_u64().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::SLONG8 => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::SignedBig(cursor.read_i64().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::IFD => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::Ifd(cursor.read_u32().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::IFD8 => {
-            let mut v = Vec::with_capacity(count as _);
-            for _ in 0..count {
-                v.push(TagValue::IfdBig(cursor.read_u64().await?))
-            }
-            Ok(TagValue::List(v))
-        }
-        Type::ASCII => {
-            let mut out = vec![0; count as _];
-            let mut buf = cursor.read(count).await?;
-            buf.read_exact(&mut out)?;
-
-            // Strings may be null-terminated, so we trim anything downstream of the null byte
-            if let Some(first) = out.iter().position(|&b| b == 0) {
-                out.truncate(first);
-            }
-            Ok(TagValue::Ascii(String::from_utf8_lossy(&out).into_owned()))
-        }
-    }
+        TagValue::List(values)
+    })
 }
 
 #[cfg(test)]

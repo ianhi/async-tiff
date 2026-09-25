@@ -4,7 +4,7 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::error::AsyncTiffResult;
+use crate::error::{AsyncTiffError, AsyncTiffResult};
 use crate::reader::{AsyncFileReader, EndianAwareReader, Endianness};
 
 /// A data source that can be used with [`TiffMetadataReader`][crate::metadata::TiffMetadataReader]
@@ -62,27 +62,21 @@ impl<'a, F: MetadataFetch> MetadataCursor<'a, F> {
         self.offset = offset;
     }
 
-    /// Advance cursor position by a set amount
-    pub(crate) fn advance(&mut self, amount: u64) {
-        self.offset += amount;
-    }
-
     /// Read the given number of bytes, advancing the internal cursor state by the same amount.
+    ///
+    /// Fails if the file ends before `length` bytes, so a length read from a malformed file never
+    /// reaches an allocation.
     pub(crate) async fn read(&mut self, length: u64) -> AsyncTiffResult<EndianAwareReader> {
-        let range = self.offset as _..(self.offset + length) as _;
-        self.offset += length;
-        let bytes = self.fetch.fetch(range).await?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| past_the_end(self.offset, length))?;
+        let bytes = self.fetch.fetch(self.offset..end).await?;
+        if (bytes.len() as u64) < length {
+            return Err(past_the_end(self.offset, length));
+        }
+        self.offset = end;
         Ok(EndianAwareReader::new(bytes, self.endianness))
-    }
-
-    /// Read a u8 from the cursor, advancing the internal state by 1 byte.
-    pub(crate) async fn read_u8(&mut self) -> AsyncTiffResult<u8> {
-        self.read(1).await?.read_u8()
-    }
-
-    /// Read a i8 from the cursor, advancing the internal state by 1 byte.
-    pub(crate) async fn read_i8(&mut self) -> AsyncTiffResult<i8> {
-        self.read(1).await?.read_i8()
     }
 
     /// Read a u16 from the cursor, advancing the internal state by 2 bytes.
@@ -90,36 +84,21 @@ impl<'a, F: MetadataFetch> MetadataCursor<'a, F> {
         self.read(2).await?.read_u16()
     }
 
-    /// Read a i16 from the cursor, advancing the internal state by 2 bytes.
-    pub(crate) async fn read_i16(&mut self) -> AsyncTiffResult<i16> {
-        self.read(2).await?.read_i16()
-    }
-
     /// Read a u32 from the cursor, advancing the internal state by 4 bytes.
     pub(crate) async fn read_u32(&mut self) -> AsyncTiffResult<u32> {
         self.read(4).await?.read_u32()
-    }
-
-    /// Read a i32 from the cursor, advancing the internal state by 4 bytes.
-    pub(crate) async fn read_i32(&mut self) -> AsyncTiffResult<i32> {
-        self.read(4).await?.read_i32()
     }
 
     /// Read a u64 from the cursor, advancing the internal state by 8 bytes.
     pub(crate) async fn read_u64(&mut self) -> AsyncTiffResult<u64> {
         self.read(8).await?.read_u64()
     }
+}
 
-    /// Read a i64 from the cursor, advancing the internal state by 8 bytes.
-    pub(crate) async fn read_i64(&mut self) -> AsyncTiffResult<i64> {
-        self.read(8).await?.read_i64()
-    }
-
-    pub(crate) async fn read_f32(&mut self) -> AsyncTiffResult<f32> {
-        self.read(4).await?.read_f32()
-    }
-
-    pub(crate) async fn read_f64(&mut self) -> AsyncTiffResult<f64> {
-        self.read(8).await?.read_f64()
-    }
+fn past_the_end(offset: u64, length: u64) -> AsyncTiffError {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("{length} bytes at offset {offset} run past the end of the file"),
+    )
+    .into()
 }

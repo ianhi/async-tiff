@@ -224,11 +224,19 @@ impl ImageFileDirectory {
                 Tag::MaxSampleValue => max_sample_value = Some(value.into_u16_vec()?),
                 Tag::XResolution => match value {
                     TagValue::Rational(n, d) => x_resolution = Some(n as f64 / d as f64),
-                    _ => unreachable!("Expected rational type for XResolution."),
+                    _ => {
+                        return Err(TiffError::FormatError(
+                            TiffFormatError::InvalidTagValueType(Tag::XResolution),
+                        ))
+                    }
                 },
                 Tag::YResolution => match value {
                     TagValue::Rational(n, d) => y_resolution = Some(n as f64 / d as f64),
-                    _ => unreachable!("Expected rational type for YResolution."),
+                    _ => {
+                        return Err(TiffError::FormatError(
+                            TiffFormatError::InvalidTagValueType(Tag::YResolution),
+                        ))
+                    }
                 },
                 Tag::PlanarConfiguration => {
                     planar_configuration = PlanarConfiguration::from_u16(value.into_u16()?)
@@ -387,14 +395,16 @@ impl ImageFileDirectory {
         Ok(Self {
             endianness,
             new_subfile_type,
-            image_width: image_width.expect("image_width not found"),
-            image_height: image_height.expect("image_height not found"),
-            bits_per_sample: bits_per_sample.expect("bits per sample not found"),
+            image_width: required(image_width, Tag::ImageWidth)?,
+            image_height: required(image_height, Tag::ImageLength)?,
+            bits_per_sample: required(bits_per_sample, Tag::BitsPerSample)?,
             // Defaults to no compression
             // https://web.archive.org/web/20240329145331/https://www.awaresystems.be/imaging/tiff/tifftags/compression.html
             compression: compression.unwrap_or(Compression::None),
-            photometric_interpretation: photometric_interpretation
-                .expect("photometric interpretation not found"),
+            photometric_interpretation: required(
+                photometric_interpretation,
+                Tag::PhotometricInterpretation,
+            )?,
             document_name,
             image_description,
             strip_offsets,
@@ -928,4 +938,8 @@ impl CompressedBytes {
             lerc_parameters: ifd.lerc_parameters.clone(),
         }
     }
+}
+
+fn required<T>(value: Option<T>, tag: Tag) -> AsyncTiffResult<T> {
+    value.ok_or_else(|| TiffError::FormatError(TiffFormatError::RequiredTagNotFound(tag)).into())
 }
