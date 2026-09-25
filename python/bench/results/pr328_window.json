@@ -1,0 +1,51 @@
+{
+ "camelyon_mask": {
+  "requests": 69,
+  "bytes": 2251382,
+  "metadata": 1765912,
+  "size": 35175812,
+  "note": ""
+ },
+ "camelyon_slide": {
+  "requests": 90,
+  "bytes": 3869157,
+  "metadata": 2757977,
+  "size": 3264779514,
+  "note": ""
+ },
+ "cog_s2_b04": {
+  "requests": 1,
+  "bytes": 32768,
+  "metadata": 3561,
+  "size": 199248358,
+  "note": ""
+ },
+ "cog_s2_tci": {
+  "requests": 1,
+  "bytes": 32768,
+  "metadata": 3621,
+  "size": 103130715,
+  "note": ""
+ },
+ "jump_image": {
+  "requests": 4,
+  "bytes": 116792,
+  "metadata": 84027,
+  "size": 2555730,
+  "note": "failed after reading: RustPanic: rust future panicked: unknown error"
+ },
+ "synth_far_tile_tables": {
+  "requests": 24,
+  "bytes": 786432,
+  "metadata": 659172,
+  "size": 18222864,
+  "note": ""
+ },
+ "synth_pixels_then_ifd": {
+  "requests": 2,
+  "bytes": 33264,
+  "metadata": 456,
+  "size": 4195056,
+  "note": ""
+ }
+}
