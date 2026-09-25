@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_tiff::metadata::cache::ReadaheadMetadataCache;
-use async_tiff::metadata::TiffMetadataReader;
+use async_tiff::metadata::{ImageFileDirectoryReader, TiffMetadataReader};
 use async_tiff::reader::{AsyncFileReader, Endianness};
 use async_tiff::ImageFileDirectory;
 use pyo3::exceptions::{PyIndexError, PyTypeError};
@@ -18,6 +18,7 @@ use crate::PyImageFileDirectory;
 #[pyclass(name = "TIFF", frozen, subclass)]
 pub(crate) struct PyTIFF {
     endianness: Endianness,
+    bigtiff: bool,
     ifds: Vec<Arc<ImageFileDirectory>>,
     reader: Arc<dyn AsyncFileReader>,
 }
@@ -34,6 +35,7 @@ async fn open(
     let ifds = metadata_reader.read_all_ifds(&metadata_fetch).await?;
     Ok(PyTIFF {
         endianness: metadata_reader.endianness(),
+        bigtiff: metadata_reader.bigtiff(),
         ifds: ifds.into_iter().map(Arc::new).collect(),
         reader,
     })
@@ -43,12 +45,13 @@ async fn read_ifd_at(
     reader: Arc<dyn AsyncFileReader>,
     offset: u64,
     prefetch: u64,
+    bigtiff: bool,
+    endianness: Endianness,
 ) -> PyAsyncTiffResult<PyImageFileDirectory> {
     let metadata_fetch = ReadaheadMetadataCache::new(reader.clone()).with_initial_size(prefetch);
-    // Re-reads the 16-byte header to learn the byte order and whether the file is a BigTIFF.
-    // Those two facts decide the structure of the directory at `offset`.
-    let metadata_reader = TiffMetadataReader::try_open(&metadata_fetch).await?;
-    let ifd = metadata_reader.read_ifd_at(&metadata_fetch, offset).await?;
+    let ifd_reader =
+        ImageFileDirectoryReader::open(&metadata_fetch, offset, bigtiff, endianness).await?;
+    let ifd = ifd_reader.read(&metadata_fetch).await?;
     Ok(PyImageFileDirectory::new(Arc::new(ifd), reader))
 }
 
@@ -116,8 +119,9 @@ impl PyTIFF {
         prefetch: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let reader = self.reader.clone();
+        let (bigtiff, endianness) = (self.bigtiff, self.endianness);
         future_into_py(py, async move {
-            Ok(read_ifd_at(reader, offset, prefetch).await?)
+            Ok(read_ifd_at(reader, offset, prefetch, bigtiff, endianness).await?)
         })
     }
 

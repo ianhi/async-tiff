@@ -56,6 +56,21 @@ class TIFF:
             The requested IFD.
         """
 
+    async def ifd_at(self, offset: int, *, prefetch: int = 32768) -> ImageFileDirectory:
+        """Read the IFD at a byte offset.
+
+        [`ifds`][async_tiff.TIFF.ifds] follows the chain of IFDs from the header, which
+        does not include SubIFDs. Their offsets are the values of tag 330 in
+        `other_tags`, and pyramid levels are commonly stored there.
+
+        Args:
+            offset: The byte offset of the IFD, such as a value of the SubIFDs tag.
+            prefetch: The number of bytes to read at `offset` up front.
+
+        Returns:
+            The IFD at that offset.
+        """
+
     @property
     def ifds(self) -> list[ImageFileDirectory]:
         """Access the underlying IFDs of this TIFF.
